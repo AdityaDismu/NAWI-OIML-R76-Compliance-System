@@ -9,7 +9,7 @@ from fastapi import (
     UploadFile,
 )
 
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from app.core.database import supabase
 
@@ -21,20 +21,10 @@ router = APIRouter(
 
 
 # -------------------------------------------------------------
-# Local upload directory
+# Supabase Storage
 # -------------------------------------------------------------
 
-UPLOAD_DIR = (
-    Path(__file__)
-    .resolve()
-    .parents[3]
-    / "uploads"
-)
-
-UPLOAD_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+BUCKET_NAME = "nawi-evidence"
 
 
 # -------------------------------------------------------------
@@ -142,16 +132,19 @@ async def upload_attachment(
 ):
 
     if not file.filename:
+
         raise HTTPException(
             status_code=400,
             detail="A file must be selected.",
         )
 
-    # ---------------------------------------------------------
-    # Verify evaluation
-    # ---------------------------------------------------------
+    storage_path = None
 
     try:
+
+        # -----------------------------------------------------
+        # Verify evaluation
+        # -----------------------------------------------------
 
         evaluation_response = (
             supabase
@@ -232,27 +225,6 @@ async def upload_attachment(
                 )
 
         # -----------------------------------------------------
-        # Generate safe local filename
-        # -----------------------------------------------------
-
-        original_name = Path(
-            file.filename
-        ).name
-
-        suffix = Path(
-            original_name
-        ).suffix
-
-        stored_name = (
-            f"{uuid4().hex}{suffix}"
-        )
-
-        target = (
-            UPLOAD_DIR
-            / stored_name
-        )
-
-        # -----------------------------------------------------
         # Read file
         # -----------------------------------------------------
 
@@ -266,13 +238,50 @@ async def upload_attachment(
             )
 
         # -----------------------------------------------------
-        # Write local file
+        # Generate safe storage path
         # -----------------------------------------------------
 
-        target.write_bytes(content)
+        original_name = Path(
+            file.filename
+        ).name
+
+        suffix = Path(
+            original_name
+        ).suffix.lower()
+
+        stored_name = (
+            f"{uuid4().hex}{suffix}"
+        )
+
+        storage_path = (
+            f"{evaluation_id}/{stored_name}"
+        )
+
+        content_type = (
+            file.content_type
+            or "application/octet-stream"
+        )
+
+        # -----------------------------------------------------
+        # Upload to Supabase Storage
+        # -----------------------------------------------------
+
+        supabase.storage.from_(
+            BUCKET_NAME
+        ).upload(
+            storage_path,
+            content,
+            {
+                "content-type": content_type,
+                "upsert": False,
+            },
+        )
 
         # -----------------------------------------------------
         # Store database record
+        #
+        # file_path now stores the Supabase Storage path.
+        # It is NOT a local filesystem path.
         # -----------------------------------------------------
 
         payload = {
@@ -283,11 +292,8 @@ async def upload_attachment(
                 else None
             ),
             "file_name": original_name,
-            "file_path": str(target),
-            "content_type": (
-                file.content_type
-                or "application/octet-stream"
-            ),
+            "file_path": storage_path,
+            "content_type": content_type,
             "file_size": len(content),
             "description": description or "",
         }
@@ -301,13 +307,23 @@ async def upload_attachment(
 
         if not response.data:
 
-            if target.exists():
-                target.unlink()
+            # Database record failed.
+            # Remove the uploaded Storage object.
+            try:
+
+                supabase.storage.from_(
+                    BUCKET_NAME
+                ).remove(
+                    [storage_path]
+                )
+
+            except Exception:
+                pass
 
             raise HTTPException(
                 status_code=500,
                 detail=(
-                    "The file was saved locally, "
+                    "The file was uploaded to storage, "
                     "but the evidence database record "
                     "could not be created."
                 ),
@@ -324,10 +340,22 @@ async def upload_attachment(
 
     except Exception as error:
 
-        # Remove local file if database operation failed.
-        if "target" in locals():
-            if target.exists():
-                target.unlink()
+        # -----------------------------------------------------
+        # Clean up Storage upload if something failed
+        # -----------------------------------------------------
+
+        if storage_path:
+
+            try:
+
+                supabase.storage.from_(
+                    BUCKET_NAME
+                ).remove(
+                    [storage_path]
+                )
+
+            except Exception:
+                pass
 
         raise HTTPException(
             status_code=500,
@@ -348,6 +376,10 @@ async def download_attachment(
 ):
 
     try:
+
+        # -----------------------------------------------------
+        # Get database record
+        # -----------------------------------------------------
 
         response = (
             supabase
@@ -370,34 +402,50 @@ async def download_attachment(
                 detail="Attachment not found.",
             )
 
-        path = Path(
+        storage_path = (
             attachment.get(
-                "file_path",
-                "",
+                "file_path"
             )
         )
 
-        if not path.exists():
+        if not storage_path:
 
             raise HTTPException(
                 status_code=404,
-                detail="Attachment file not found.",
+                detail="Attachment storage path not found.",
             )
 
-        return FileResponse(
-            path,
+        # -----------------------------------------------------
+        # Download from Supabase Storage
+        # -----------------------------------------------------
+
+        file_bytes = (
+            supabase
+            .storage
+            .from_(BUCKET_NAME)
+            .download(storage_path)
+        )
+
+        return Response(
+            content=file_bytes,
             media_type=(
                 attachment.get(
                     "content_type"
                 )
                 or "application/octet-stream"
             ),
-            filename=(
-                attachment.get(
-                    "file_name"
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename=\""
+                    + (
+                        attachment.get(
+                            "file_name"
+                        )
+                        or "evidence"
+                    )
+                    + "\""
                 )
-                or path.name
-            ),
+            },
         )
 
     except HTTPException:
@@ -426,6 +474,10 @@ async def delete_attachment(
 
     try:
 
+        # -----------------------------------------------------
+        # Get attachment
+        # -----------------------------------------------------
+
         response = (
             supabase
             .table("attachments")
@@ -451,12 +503,43 @@ async def delete_attachment(
                 detail="Attachment not found.",
             )
 
-        path = Path(
+        storage_path = (
             attachment.get(
-                "file_path",
-                "",
+                "file_path"
             )
         )
+
+        # -----------------------------------------------------
+        # Delete Storage object
+        # -----------------------------------------------------
+
+        if storage_path:
+
+            try:
+
+                (
+                    supabase
+                    .storage
+                    .from_(BUCKET_NAME)
+                    .remove(
+                        [storage_path]
+                    )
+                )
+
+            except Exception as storage_error:
+
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Unable to delete evidence "
+                        "from storage: "
+                        f"{storage_error}"
+                    ),
+                )
+
+        # -----------------------------------------------------
+        # Delete database record
+        # -----------------------------------------------------
 
         (
             supabase
@@ -468,9 +551,6 @@ async def delete_attachment(
             )
             .execute()
         )
-
-        if path.exists():
-            path.unlink()
 
         return {
             "success": True
