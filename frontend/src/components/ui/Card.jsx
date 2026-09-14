@@ -1,0 +1,1 @@
+export default function Card({ children, className = "", onClick }) { return <div onClick={onClick} className={`rounded-xl border border-[#d7e0e8] bg-white p-5 shadow-[0_2px_12px_rgba(27,54,78,0.06)] ${className}`}>{children}</div>; }
